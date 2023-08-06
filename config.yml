@@ -1,0 +1,6 @@
+unique_name: "client"
+is_server: false
+server_address: 127.0.0.1
+server_port: 3400
+ssl_key: "./keyStore.p12"
+
