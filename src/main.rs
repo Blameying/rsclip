@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio_native_tls::native_tls::Identity;
 
@@ -33,11 +34,15 @@ struct Args {
     /// paste the string from server manually
     #[arg(long)]
     paste: bool,
+    /// keep synchronizing the data from server automatically
+    #[arg(long)]
+    sync: bool,
 }
 
 enum Cmd {
     Copy,
     Paste,
+    Sync,
     Invalid,
 }
 
@@ -46,6 +51,7 @@ impl Cmd {
         match self {
             Cmd::Copy => 0,
             Cmd::Paste => 1,
+            Cmd::Sync => 2,
             Cmd::Invalid => u32::MAX,
         }
     }
@@ -54,6 +60,7 @@ impl Cmd {
         match i {
             0 => Cmd::Copy,
             1 => Cmd::Paste,
+            2 => Cmd::Sync,
             _ => Cmd::Invalid,
         }
     }
@@ -77,11 +84,13 @@ async fn server(config: &Config) -> Result<(), Box<dyn Error>> {
         tokio_native_tls::native_tls::TlsAcceptor::builder(cert).build()?,
     );
     let global_cache = Arc::new(Mutex::new(Vec::new()));
+    let (tx, _) = broadcast::channel(16);
 
     loop {
         let (socket, _) = tcp.accept().await?;
         let tls_acceptor = tls_acceptor.clone();
         let global_cache = global_cache.clone();
+        let tx = tx.clone();
         tokio::spawn(async move {
             let mut tls_stream = tls_acceptor.accept(socket).await.expect("Accept error");
 
@@ -109,6 +118,9 @@ async fn server(config: &Config) -> Result<(), Box<dyn Error>> {
                         .expect("Failed to read data from socket.");
                     let mut global = global_cache.lock().await;
                     *global = data;
+                    if tx.receiver_count() != 0 {
+                        tx.send(1).unwrap();
+                    }
                 }
                 Cmd::Paste => {
                     let global = global_cache.lock().await;
@@ -118,7 +130,33 @@ async fn server(config: &Config) -> Result<(), Box<dyn Error>> {
                         .expect("Failed to write data back.");
                     dbg!("{}", String::from_utf8(global.to_vec()).unwrap());
                 }
-                _ => {
+                Cmd::Sync => {
+                    let mut rx = tx.subscribe();
+
+                    loop {
+                        let signal = rx.recv().await;
+                        if signal.is_ok() {
+                            let global = global_cache.lock().await;
+                            let msg_header: MsgHeader = MsgHeader {
+                                header: 0xdeadbeaf,
+                                cmd: Cmd::Sync.to_u32(),
+                                length: global.len() as u64,
+                            };
+                            let encoded: Vec<u8> = bincode::serialize(&msg_header).unwrap();
+                            let status = tls_stream.write_all(&encoded).await;
+                            if status.is_err() {
+                                println!("Failed to sync header.");
+                                break;
+                            }
+                            let status = tls_stream.write_all(&global.to_vec()).await;
+                            if status.is_err() {
+                                println!("Failed to sync msg.");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Cmd::Invalid => {
                     println!("Invalid Cmd.");
                 }
             }
@@ -128,6 +166,13 @@ async fn server(config: &Config) -> Result<(), Box<dyn Error>> {
 
 async fn client(config: &Config, cmd: Cmd, msg: Option<String>) -> Result<String, Box<dyn Error>> {
     let addr = config.server_address.clone() + ":" + config.server_port.to_string().as_str();
+
+    let socket = TcpStream::connect(&addr).await?;
+    let mut native_tls_builder = tokio_native_tls::native_tls::TlsConnector::builder();
+    native_tls_builder.danger_accept_invalid_certs(true);
+    let cx = native_tls_builder.build()?;
+    let cx = tokio_native_tls::TlsConnector::from(cx);
+    let mut stream = cx.connect(config.server_address.as_str(), socket).await?;
 
     match cmd {
         Cmd::Copy => {
@@ -141,13 +186,6 @@ async fn client(config: &Config, cmd: Cmd, msg: Option<String>) -> Result<String
             let mut encoded: Vec<u8> = bincode::serialize(&msg_header)?;
             encoded.extend_from_slice(data);
 
-            let socket = TcpStream::connect(&addr).await?;
-            let mut native_tls_builder = tokio_native_tls::native_tls::TlsConnector::builder();
-            native_tls_builder.danger_accept_invalid_certs(true);
-            let cx = native_tls_builder.build()?;
-            let cx = tokio_native_tls::TlsConnector::from(cx);
-
-            let mut stream = cx.connect(config.server_address.as_str(), socket).await?;
             stream.write_all(&encoded).await?;
         }
         Cmd::Paste => {
@@ -158,13 +196,6 @@ async fn client(config: &Config, cmd: Cmd, msg: Option<String>) -> Result<String
             };
             let encoded: Vec<u8> = bincode::serialize(&msg_header)?;
 
-            let socket = TcpStream::connect(&addr).await?;
-            let mut native_tls_builder = tokio_native_tls::native_tls::TlsConnector::builder();
-            native_tls_builder.danger_accept_invalid_certs(true);
-            let cx = native_tls_builder.build()?;
-            let cx = tokio_native_tls::TlsConnector::from(cx);
-
-            let mut stream = cx.connect(config.server_address.as_str(), socket).await?;
             stream.write_all(&encoded).await?;
 
             let mut data_recv: Vec<u8> = Vec::new();
@@ -173,6 +204,36 @@ async fn client(config: &Config, cmd: Cmd, msg: Option<String>) -> Result<String
             if !data_recv.is_empty() {
                 let mut ctx = ClipboardContext::new().unwrap();
                 ctx.set_contents(String::from_utf8(data_recv).unwrap())
+                    .unwrap();
+            }
+        }
+        Cmd::Sync => {
+            let msg_header: MsgHeader = MsgHeader {
+                header: 0xdeadbeaf,
+                cmd: cmd.to_u32(),
+                length: 0,
+            };
+            let encoded: Vec<u8> = bincode::serialize(&msg_header)?;
+
+            stream.write_all(&encoded).await?;
+
+            loop {
+                let mut header_buf: Vec<u8> = vec![0; mem::size_of::<MsgHeader>()];
+                stream.read_exact(&mut header_buf).await?;
+                let msg: MsgHeader = bincode::deserialize(&header_buf).unwrap();
+                if msg.header != 0xdeadbeaf {
+                    println!("Sync data error, header mismatch!");
+                    break;
+                }
+                if msg.cmd != Cmd::Sync.to_u32() {
+                    println!("Sync data error, header cmd mismatch!");
+                    break;
+                }
+
+                let mut data_buf: Vec<u8> = vec![0; msg.length as usize];
+                stream.read_exact(&mut data_buf).await?;
+                let mut ctx = ClipboardContext::new().unwrap();
+                ctx.set_contents(String::from_utf8(data_buf).unwrap())
                     .unwrap();
             }
         }
@@ -195,6 +256,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if config.is_server {
         server(&config).await?;
     } else {
+        if cli.sync {
+            client(&config, Cmd::Sync, None).await?;
+        }
         if cli.paste {
             let msg = client(&config, Cmd::Paste, None).await?;
             dbg!("{}", msg);
