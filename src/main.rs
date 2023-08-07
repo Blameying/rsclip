@@ -128,7 +128,6 @@ async fn server(config: &Config) -> Result<(), Box<dyn Error>> {
                         .write_all(&global.to_vec())
                         .await
                         .expect("Failed to write data back.");
-                    dbg!("{}", String::from_utf8(global.to_vec()).unwrap());
                 }
                 Cmd::Sync => {
                     let mut rx = tx.subscribe();
@@ -201,10 +200,19 @@ async fn client(config: &Config, cmd: Cmd, msg: Option<String>) -> Result<String
             let mut data_recv: Vec<u8> = Vec::new();
             stream.read_to_end(&mut data_recv).await?;
 
-            if !data_recv.is_empty() {
-                let mut ctx = ClipboardContext::new().unwrap();
-                ctx.set_contents(String::from_utf8(data_recv).unwrap())
-                    .unwrap();
+            let data = String::from_utf8(data_recv).unwrap_or_default();
+            println!("{}", data);
+            if !data.is_empty() {
+                let result = ClipboardContext::new();
+                if result.is_err() {
+                    eprintln!("No support clipboard found.");
+                    return Ok(String::new());
+                }
+                let mut ctx = result.unwrap();
+                let result = ctx.set_contents(data);
+                if result.is_err() {
+                    eprintln!("{:?}", result);
+                }
             }
         }
         Cmd::Sync => {
@@ -232,9 +240,17 @@ async fn client(config: &Config, cmd: Cmd, msg: Option<String>) -> Result<String
 
                 let mut data_buf: Vec<u8> = vec![0; msg.length as usize];
                 stream.read_exact(&mut data_buf).await?;
-                let mut ctx = ClipboardContext::new().unwrap();
-                ctx.set_contents(String::from_utf8(data_buf).unwrap())
-                    .unwrap();
+
+                let result = ClipboardContext::new();
+                if result.is_err() {
+                    eprintln!("No support clipboard found.");
+                    return Ok(String::new());
+                }
+                let mut ctx = result.unwrap();
+                let result = ctx.set_contents(String::from_utf8(data_buf).unwrap());
+                if result.is_err() {
+                    eprintln!("{:?}", result);
+                }
             }
         }
         _ => {
@@ -260,8 +276,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             client(&config, Cmd::Sync, None).await?;
         }
         if cli.paste {
-            let msg = client(&config, Cmd::Paste, None).await?;
-            dbg!("{}", msg);
+            client(&config, Cmd::Paste, None).await?;
         }
         if let Some(data) = cli.copy {
             client(&config, Cmd::Copy, Some(data)).await?;
