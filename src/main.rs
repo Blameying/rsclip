@@ -215,7 +215,7 @@ async fn client(config: &Config, cmd: Cmd, msg: Option<String>) -> Result<String
             if !data.is_empty() {
                 let result = ClipboardContext::new();
                 if result.is_err() {
-                    eprintln!("No support clipboard found.");
+                    // eprintln!("No support clipboard found.");
                     return Ok(String::new());
                 }
                 let mut ctx = result.unwrap();
