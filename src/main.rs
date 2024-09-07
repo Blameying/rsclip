@@ -163,15 +163,25 @@ async fn server(config: &Config) -> Result<(), Box<dyn Error>> {
     }
 }
 
+use tokio::time::{timeout, Duration};
+
 async fn client(config: &Config, cmd: Cmd, msg: Option<String>) -> Result<String, Box<dyn Error>> {
     let addr = config.server_address.clone() + ":" + config.server_port.to_string().as_str();
 
-    let socket = TcpStream::connect(&addr).await?;
-    let mut native_tls_builder = tokio_native_tls::native_tls::TlsConnector::builder();
-    native_tls_builder.danger_accept_invalid_certs(true);
-    let cx = native_tls_builder.build()?;
-    let cx = tokio_native_tls::TlsConnector::from(cx);
-    let mut stream = cx.connect(config.server_address.as_str(), socket).await?;
+    async fn connect_and_secure(
+        addr: &str,
+        config: &Config,
+    ) -> Result<tokio_native_tls::TlsStream<TcpStream>, Box<dyn Error>> {
+        let socket = TcpStream::connect(addr).await?;
+        let mut native_tls_builder = tokio_native_tls::native_tls::TlsConnector::builder();
+        native_tls_builder.danger_accept_invalid_certs(true);
+        let cx = native_tls_builder.build()?;
+        let cx = tokio_native_tls::TlsConnector::from(cx);
+        let stream = cx.connect(config.server_address.as_str(), socket).await?;
+        Ok(stream)
+    }
+
+    let mut stream = connect_and_secure(&addr, config).await?;
 
     match cmd {
         Cmd::Copy => {
@@ -226,30 +236,44 @@ async fn client(config: &Config, cmd: Cmd, msg: Option<String>) -> Result<String
             stream.write_all(&encoded).await?;
 
             loop {
-                let mut header_buf: Vec<u8> = vec![0; mem::size_of::<MsgHeader>()];
-                stream.read_exact(&mut header_buf).await?;
-                let msg: MsgHeader = bincode::deserialize(&header_buf).unwrap();
-                if msg.header != 0xdeadbeaf {
-                    println!("Sync data error, header mismatch!");
-                    break;
-                }
-                if msg.cmd != Cmd::Sync.to_u32() {
-                    println!("Sync data error, header cmd mismatch!");
-                    break;
-                }
+                let result = timeout(Duration::from_secs(10), async {
+                    let mut header_buf: Vec<u8> = vec![0; mem::size_of::<MsgHeader>()];
+                    stream.read_exact(&mut header_buf).await?;
+                    let msg: MsgHeader = bincode::deserialize(&header_buf).unwrap();
+                    if msg.header != 0xdeadbeaf {
+                        println!("Sync data error, header mismatch!");
+                        return Ok(());
+                    }
+                    if msg.cmd != Cmd::Sync.to_u32() {
+                        println!("Sync data error, header cmd mismatch!");
+                        return Ok(());
+                    }
 
-                let mut data_buf: Vec<u8> = vec![0; msg.length as usize];
-                stream.read_exact(&mut data_buf).await?;
+                    let mut data_buf: Vec<u8> = vec![0; msg.length as usize];
+                    stream.read_exact(&mut data_buf).await?;
 
-                let result = ClipboardContext::new();
+                    let result = ClipboardContext::new();
+                    if result.is_err() {
+                        eprintln!("No support clipboard found.");
+                        return Ok(());
+                    }
+                    let mut ctx = result.unwrap();
+                    let result = ctx.set_contents(String::from_utf8(data_buf).unwrap());
+                    if result.is_err() {
+                        eprintln!("{:?}", result);
+                    }
+                    Ok::<(), Box<dyn Error>>(())
+                })
+                .await;
+
                 if result.is_err() {
-                    eprintln!("No support clipboard found.");
-                    return Ok(String::new());
-                }
-                let mut ctx = result.unwrap();
-                let result = ctx.set_contents(String::from_utf8(data_buf).unwrap());
-                if result.is_err() {
-                    eprintln!("{:?}", result);
+                    match stream.write_all(&encoded).await {
+                        Ok(_) => {}
+                        Err(_) => {
+                            println!("Sync command timed out. Reconnecting...");
+                            stream = connect_and_secure(&addr, config).await?;
+                        }
+                    }
                 }
             }
         }
